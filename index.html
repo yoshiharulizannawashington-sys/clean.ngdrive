@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0c0f" />
+    <meta
+      name="description"
+      content="Browser Drive — a browser-native vehicle simulation sandbox. Milestone 0 foundation build."
+    />
+    <title>Browser Drive — Vehicle Simulation</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <canvas id="viewport" aria-label="3D simulation viewport"></canvas>
+
+      <!-- Loading -->
+      <div id="loading" class="overlay overlay--loading">
+        <div class="loader">
+          <div class="loader__mark">
+            <span></span><span></span><span></span>
+          </div>
+          <p class="loader__title">BROWSER DRIVE</p>
+          <p class="loader__status" id="loading-status">Initialising renderer…</p>
+          <div class="loader__track"><i id="loading-bar"></i></div>
+          <p class="loader__hint">WebGL 2 · fixed-timestep simulation worker · Rapier 3D</p>
+        </div>
+      </div>
+
+      <!-- Main menu -->
+      <div id="menu" class="overlay overlay--menu" hidden>
+        <div class="menu">
+          <header class="menu__head">
+            <p class="eyebrow">Vehicle simulation sandbox</p>
+            <h1>BROWSER<span>DRIVE</span></h1>
+            <p class="menu__lede">
+              A browser-native driving simulator built around a fixed-timestep physics worker: independent
+              suspension, slip-based tire forces, torque-curve engine and a driveline that actually drives the
+              wheels.
+            </p>
+          </header>
+
+          <div class="menu__grid">
+            <section class="card card--session">
+              <h2>Session</h2>
+              <dl class="spec">
+                <div><dt>Vehicle</dt><dd id="menu-vehicle">Falcon S4</dd></div>
+                <div><dt>Layout</dt><dd>Front engine · RWD</dd></div>
+                <div><dt>Map</dt><dd>Vehicle Test Facility</dd></div>
+                <div><dt>Simulation</dt><dd>120 Hz fixed step</dd></div>
+              </dl>
+
+              <label class="field" for="quality">
+                <span>Graphics profile</span>
+                <select id="quality">
+                  <option value="performance">Performance — Chromebook priority</option>
+                  <option value="balanced" selected>Balanced</option>
+                  <option value="high">High</option>
+                </select>
+              </label>
+
+              <button id="btn-play" class="btn btn--primary" type="button">
+                <span>Enter the test facility</span>
+                <kbd>↵</kbd>
+              </button>
+
+              <p class="card__note">
+                The simulation is already running behind this menu. Every frame you see is produced by the
+                same worker that will drive the car.
+              </p>
+            </section>
+
+            <section class="card">
+              <h2>Foundation status</h2>
+              <p class="card__sub">Milestone 0 — what is real, and what is not.</p>
+              <ul class="status status--done">
+                <li>Fixed 120 Hz simulation in a Web Worker, interpolated rendering</li>
+                <li>Rapier rigid-body world: chassis, ground, barriers, ramps, dynamic cones</li>
+                <li>Four independently raycast suspension units with springs, dampers, anti-roll bars</li>
+                <li>Slip-ratio / slip-angle tire model with load sensitivity and combined slip</li>
+                <li>Torque-curve engine, automatic gearbox, open differential, RWD driveline</li>
+                <li>Weight transfer, body roll, wheel lock-up and wheelspin from the solver</li>
+                <li>Chase, close, hood, cockpit and free cameras · keyboard and gamepad</li>
+              </ul>
+              <ul class="status status--todo">
+                <li>Soft-body node/beam deformation — not implemented (Phase 3)</li>
+                <li>Mechanical damage and failures — not implemented (Phase 4)</li>
+                <li>Traffic, weather, audio — not implemented (Phases 8–10)</li>
+              </ul>
+            </section>
+
+            <section class="card card--controls">
+              <h2>Controls</h2>
+              <table class="keys">
+                <tr><td><kbd>W</kbd><kbd>S</kbd></td><td>Throttle / brake &amp; reverse</td></tr>
+                <tr><td><kbd>A</kbd><kbd>D</kbd></td><td>Steer</td></tr>
+                <tr><td><kbd>Space</kbd></td><td>Handbrake</td></tr>
+                <tr><td><kbd>E</kbd><kbd>Q</kbd></td><td>Shift up / down (manual)</td></tr>
+                <tr><td><kbd>C</kbd></td><td>Cycle camera</td></tr>
+                <tr><td><kbd>F</kbd></td><td>Free camera (drag to orbit, wheel to zoom)</td></tr>
+                <tr><td><kbd>R</kbd></td><td>Reset vehicle</td></tr>
+                <tr><td><kbd>Esc</kbd></td><td>Pause</td></tr>
+              </table>
+              <p class="card__note">
+                Gamepad: left stick steer, triggers throttle/brake, A handbrake, RB/LB shift.
+              </p>
+            </section>
+          </div>
+
+          <footer class="menu__foot">
+            <span>Milestone 0 · foundation build</span>
+            <span id="menu-capability">Detecting hardware…</span>
+          </footer>
+        </div>
+      </div>
+
+      <!-- Pause -->
+      <div id="pause" class="overlay overlay--pause" hidden>
+        <div class="pause">
+          <p class="eyebrow">Simulation paused</p>
+          <h2>Session</h2>
+          <div class="pause__actions">
+            <button id="btn-resume" class="btn btn--primary" type="button">Resume</button>
+            <button id="btn-reset" class="btn" type="button">Reset vehicle</button>
+            <button id="btn-menu" class="btn btn--ghost" type="button">Return to main menu</button>
+          </div>
+          <p class="card__note" id="pause-stats">—</p>
+        </div>
+      </div>
+
+      <!-- HUD -->
+      <div id="hud" class="hud" hidden>
+        <div class="hud__top">
+          <span class="chip" id="hud-camera">Chase</span>
+          <span class="chip chip--muted" id="hud-sim">SIM 120 Hz</span>
+        </div>
+        <div class="hud__cluster">
+          <div class="speedo">
+            <div class="speedo__main">
+              <span class="speedo__value" id="hud-speed">0</span>
+              <span class="speedo__unit">km/h</span>
+            </div>
+            <div class="speedo__bar"><i id="hud-speed-fill"></i></div>
+          </div>
+          <div class="tacho">
+            <div class="tacho__head">
+              <span>RPM</span>
+              <b id="hud-rpm">0</b>
+              <span class="tacho__gear" id="hud-gear">N</span>
+            </div>
+            <div class="tacho__track"><i id="hud-rpm-fill"></i></div>
+            <div class="tacho__pedals">
+              <div class="pedal"><span>THR</span><div class="pedal__track"><i id="hud-throttle"></i></div></div>
+              <div class="pedal"><span>BRK</span><div class="pedal__track"><i id="hud-brake"></i></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="hud__foot">
+          <span id="hud-contact">wheels 0/4 grounded</span>
+          <span class="hud__warn">No soft-body damage simulation yet</span>
+        </div>
+      </div>
+
+      <!-- Performance monitor -->
+      <div id="perf" class="perf" hidden>
+        <div class="perf__head">
+          <span>Performance</span>
+          <b id="perf-profile">balanced</b>
+        </div>
+        <div class="perf__row"><span>FPS</span><b id="perf-fps">—</b></div>
+        <div class="perf__row"><span>Frame</span><b id="perf-frame">—</b></div>
+        <div class="perf__row"><span>Sim step</span><b id="perf-sim">—</b></div>
+        <div class="perf__row"><span>Sim rate</span><b id="perf-steps">—</b></div>
+        <div class="perf__row"><span>Snapshot age</span><b id="perf-age">—</b></div>
+        <div class="perf__row"><span>Render scale</span><b id="perf-scale">—</b></div>
+        <div class="perf__row"><span>Draw calls</span><b id="perf-draws">—</b></div>
+        <div class="perf__row"><span>Triangles</span><b id="perf-tris">—</b></div>
+        <div class="perf__row perf__row--muted"><span>Quality</span><b id="perf-quality">—</b></div>
+      </div>
+
+      <div id="error-banner" class="error" hidden>
+        <strong>Runtime error</strong>
+        <p id="error-text"></p>
+        <button id="error-dismiss" class="btn btn--small" type="button">Dismiss</button>
+      </div>
+    </div>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
