@@ -1,3 +1,4 @@
+import type { SurfaceGrip } from '../surfaces';
 import type { TireConfig } from './types';
 
 /**
@@ -6,6 +7,10 @@ import type { TireConfig } from './types';
  * This is a real slip-based model: force is produced from longitudinal slip
  * ratio and lateral slip angle, scaled by the vertical load and its sensitivity.
  * It is not a lookup table and it does not move the vehicle by script.
+ *
+ * The contact surface supplies its available longitudinal and lateral grip plus
+ * rolling resistance; the tire compound still defines the shape of the slip
+ * curve and the load sensitivity.
  */
 
 export interface TireForceInput {
@@ -25,6 +30,12 @@ export interface TireForces {
   effectiveMu: number;
   saturated: boolean;
 }
+
+export const REFERENCE_SURFACE: SurfaceGrip = {
+  gripLong: 1,
+  gripLat: 1,
+  rollingResistance: 0.014,
+};
 
 /** Standard Pacejka-style curve: D * sin(C * atan(B*s - E*(B*s - atan(B*s)))). */
 export function magicFormula(slip: number, stiffness: number, shape: number, peak: number, curvature: number): number {
@@ -53,31 +64,41 @@ export function peakSlipAngle(tire: TireConfig): number {
   return Math.tan(Math.PI / (2 * tire.cLat)) / tire.bLat;
 }
 
-export function tireForces(tire: TireConfig, input: TireForceInput): TireForces {
+export function tireForces(
+  tire: TireConfig,
+  input: TireForceInput,
+  surface: SurfaceGrip = REFERENCE_SURFACE,
+): TireForces {
   const load = Math.max(0, input.load);
   if (load <= 1) {
     return { longitudinal: 0, lateral: 0, effectiveMu: 0, saturated: false };
   }
 
   const mu = effectiveMu(tire, load);
-  const peak = mu * load;
+  // The surface scales the available force per axis; the compound still defines
+  // the shape of the curve and how load sensitivity reduces it.
+  const peakLong = mu * load * Math.max(0, surface.gripLong);
+  const peakLat = mu * load * Math.max(0, surface.gripLat);
 
-  let fx = magicFormula(input.slipRatio, tire.bLong, tire.cLong, peak, tire.eLong);
-  let fy = -magicFormula(input.slipAngle, tire.bLat, tire.cLat, peak, tire.eLat);
+  let fx = magicFormula(input.slipRatio, tire.bLong, tire.cLong, peakLong, tire.eLong);
+  let fy = -magicFormula(input.slipAngle, tire.bLat, tire.cLat, peakLat, tire.eLat);
 
-  // Combined slip: the friction circle couples longitudinal and lateral demand.
-  const magnitude = Math.hypot(fx, fy);
+  // Combined slip: a friction ellipse across the two axes, so using grip for
+  // cornering takes it away from acceleration and vice versa.
   let saturated = false;
-  if (magnitude > peak) {
-    const k = peak / magnitude;
-    fx *= k;
-    fy *= k;
-    saturated = true;
+  if (peakLong > 1e-6 && peakLat > 1e-6) {
+    const utilisation = Math.hypot(fx / peakLong, fy / peakLat);
+    if (utilisation > 1) {
+      const k = 1 / utilisation;
+      fx *= k;
+      fy *= k;
+      saturated = true;
+    }
   }
 
-  // Rolling resistance opposes rotation-independent motion at the contact patch.
+  // Rolling resistance opposes motion at the contact patch.
   if (Math.abs(input.forwardSpeed) > 0.25) {
-    fx -= Math.sign(input.forwardSpeed) * tire.rollingResistance * load;
+    fx -= Math.sign(input.forwardSpeed) * surface.rollingResistance * load;
   }
 
   return { longitudinal: fx, lateral: fy, effectiveMu: mu, saturated };

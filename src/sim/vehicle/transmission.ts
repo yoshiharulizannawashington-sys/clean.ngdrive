@@ -15,6 +15,8 @@ export function wheelRpmFromWheelOmega(omega: number, ratio: number, finalDrive:
 
 export interface TransmissionInput {
   rpm: number;
+  /** Engine speed the current gear would give at road speed (no wheelspin). */
+  roadRpm?: number;
   throttle: number;
   /** Signed forward speed in m/s. */
   speed: number;
@@ -42,6 +44,10 @@ export interface TransmissionUpdate {
 export class Transmission {
   gear = 1;
   private timer = 0;
+  /** Prevent an immediate shift back after a shift has just completed. */
+  private holdTimer = 0;
+  /** Time spent continuously below the downshift threshold. */
+  private lowRpmTimer = 0;
 
   constructor(private readonly config: TransmissionConfig) {}
 
@@ -60,17 +66,26 @@ export class Transmission {
   reset(): void {
     this.gear = 1;
     this.timer = 0;
+    this.holdTimer = 0;
+    this.lowRpmTimer = 0;
   }
 
   private shiftTo(gear: number): boolean {
     if (gear === this.gear) return false;
     this.gear = gear;
     this.timer = Math.max(0.05, this.config.shiftTime);
+    // Settle time so an automatic cannot bounce straight back to the old gear
+    // (for example an immediate kickdown right after an upshift).
+    this.holdTimer = this.timer + 0.8;
+    this.lowRpmTimer = 0;
     return true;
   }
 
   update(dt: number, input: TransmissionInput): TransmissionUpdate {
     if (this.timer > 0) this.timer = Math.max(0, this.timer - dt);
+    if (this.holdTimer > 0) this.holdTimer = Math.max(0, this.holdTimer - dt);
+    if (input.rpm < this.config.downshiftRpm) this.lowRpmTimer += dt;
+    else this.lowRpmTimer = 0;
 
     const { gear } = this;
     let shifted = false;
@@ -91,18 +106,36 @@ export class Transmission {
       } else if (gear === -1 && Math.abs(input.speed) < 0.3 && input.brake < 0.1 && input.throttle < 0.05) {
         shifted = this.shiftTo(1);
       } else if (gear > 0) {
+        // Refuse an upshift that would leave the next gear lugging below its
+        // downshift point; wheelspin can otherwise raise engine rpm while the
+        // car is still too slow for the next gear.
+        const currentRatio = gearRatioFor(this.config, gear);
+        const nextRatio = gearRatioFor(this.config, gear + 1);
+        const roadRpm = input.roadRpm ?? input.rpm;
+        const nextRoadRpm = currentRatio > 0 ? (roadRpm * nextRatio) / currentRatio : 0;
+        const nextGearViable = nextRoadRpm >= this.config.downshiftRpm * 1.15;
+
         if (
           input.rpm > this.config.upshiftRpm &&
           input.throttle > 0.02 &&
-          gear < this.gearCount
+          gear < this.gearCount &&
+          nextGearViable
         ) {
           shifted = this.shiftTo(gear + 1);
-        } else if (
-          gear > 1 &&
-          (input.rpm < this.config.downshiftRpm ||
-            (input.throttle > 0.85 && input.rpm < this.config.kickdownRpm))
-        ) {
-          shifted = this.shiftTo(gear - 1);
+        } else if (gear > 1 && (this.holdTimer <= 0 || input.roadRpm === undefined)) {
+          // Downshifts need a dwell at road speed (prevents hunting around a
+          // shift point) and an explicit kickdown. Sequential upshifts above
+          // are not held back: only reversing direction is.
+          const dwellOk = input.roadRpm === undefined || this.lowRpmTimer > 0.5;
+          const kickdown =
+            input.throttle > 0.95 &&
+            input.rpm < this.config.kickdownRpm * 0.8 &&
+            this.config.upshiftRpm - input.rpm > 2200;
+          if (this.lowRpmTimer > 0 && dwellOk && (kickdown || input.rpm < this.config.downshiftRpm)) {
+            shifted = this.shiftTo(gear - 1);
+          } else if (kickdown) {
+            shifted = this.shiftTo(gear - 1);
+          }
         }
       }
     }

@@ -1,3 +1,4 @@
+import type { SurfaceId } from './surfaces';
 import type { VehicleConfig } from './vehicle/types';
 
 /** Shared message protocol between the main thread and the simulation worker. */
@@ -10,6 +11,8 @@ export interface SpawnPoint {
   position: [number, number, number];
   /** Yaw in radians about +Y. */
   yaw: number;
+  /** Optional initial linear velocity in m/s (used by scenarios and tests). */
+  velocity?: [number, number, number];
 }
 
 export interface InputState {
@@ -43,6 +46,10 @@ export interface WheelSnapshot {
   load: number;
   slipRatio: number;
   slipAngle: number;
+  /** Surface material under this wheel. */
+  surface: SurfaceId;
+  /** Blended longitudinal grip multiplier (1 = dry asphalt). */
+  grip: number;
 }
 
 export interface VehicleSnapshot {
@@ -57,6 +64,12 @@ export interface VehicleSnapshot {
   brake: number;
   handbrake: number;
   steerAngle: number;
+  /** False when the engine has stalled and is waiting to be restarted. */
+  engineRunning: boolean;
+  /** 0..1 clutch engagement. */
+  clutchEngagement: number;
+  /** Engine minus shaft angular velocity, rad/s (positive = clutch slipping). */
+  clutchSlip: number;
 }
 
 export interface PropSnapshot {

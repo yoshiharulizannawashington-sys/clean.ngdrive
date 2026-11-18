@@ -2,11 +2,14 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import type { Collider, RigidBody, World } from '@dimforge/rapier3d-compat';
 import type { InputState, SpawnPoint, VehicleSnapshot, WheelSnapshot } from '../protocol';
 import type { VehicleConfig } from './types';
-import { Transmission, wheelRpmFromWheelOmega } from './transmission';
-import { engineNetTorque } from './engine';
+import { Transmission } from './transmission';
+import { Engine, engineNetTorque } from './engine';
+import { advanceEngagement, clutchEngagementTarget, clutchTorque, launchCapacityLimit } from './clutch';
+import { distributeAxleTorque } from './differential';
 import { tireForces } from './tire';
 import { antiRollForce, suspensionForce } from './suspension';
-import { perWheelTorque, splitAxleTorque } from './drivetrain';
+import { drivenWheelIndices, splitAxleTorque } from './drivetrain';
+import { DEFAULT_SURFACE_ID, SURFACES, surfaceGrip, type SurfaceGrip, type SurfaceId } from '../surfaces';
 import {
   add,
   clamp,
@@ -19,7 +22,6 @@ import {
   rotate,
   rotateAround,
   scale,
-  smoothstep,
   sub,
   vec3,
   type Quat,
@@ -54,9 +56,16 @@ interface WheelRuntime {
   forward: Vec3;
   lateral: Vec3;
   longVel: number;
+
+  /** Contact surface and its smoothed grip (blended to avoid force steps). */
+  surface: SurfaceId;
+  grip: SurfaceGrip;
 }
 
 const WHEEL_NAMES = ['front-left', 'front-right', 'rear-left', 'rear-right'];
+
+/** Time constant for blending grip when a wheel crosses a surface boundary. */
+const SURFACE_BLEND_SECONDS = 0.12;
 
 /**
  * Vehicle simulation: a rigid chassis carried by four independently solved
@@ -64,14 +73,16 @@ const WHEEL_NAMES = ['front-left', 'front-right', 'rear-left', 'rear-right'];
  *
  * Each step:
  *  1. read the chassis state from Rapier,
- *  2. derive engine rpm from the driven wheels through the gearbox,
- *  3. raycast each suspension against the world, spring/damper/anti-roll forces,
- *  4. compute slip-based tire forces at each contact patch,
- *  5. apply those forces as impulses at the contact points,
- *  6. integrate wheel rotation from drive torque, brake torque and tire reaction.
+ *  2. update the gearbox, then solve the clutch between the engine's own
+ *     rotational state and the driven wheels,
+ *  3. distribute clutch torque through the differentials to the wheels,
+ *  4. raycast each suspension against the world (and read its surface),
+ *  5. compute slip-based tire forces on that surface at each contact patch,
+ *  6. apply those forces as impulses at the contact points,
+ *  7. integrate wheel rotation from drive torque, brake torque and tire reaction.
  *
- * Weight transfer, body roll, pitch, wheelspin and lock-up all come out of that
- * loop; nothing is animated.
+ * Weight transfer, body roll, pitch, wheelspin, lock-up, engine rev flare and
+ * clutch slip all come out of that loop; nothing is animated.
  */
 export class VehicleSim {
   readonly config: VehicleConfig;
@@ -80,19 +91,30 @@ export class VehicleSim {
   private readonly collider: Collider;
   private readonly wheels: WheelRuntime[] = [];
   private readonly transmission: Transmission;
+  private readonly engine: Engine;
+  private readonly surfaceLookup: (colliderHandle: number) => SurfaceId;
   private spawn: SpawnPoint;
 
   private steerAngle = 0;
-  private engineRpm: number;
   private inputThrottle = 0;
   private inputBrake = 0;
   private inputHandbrake = 0;
 
-  constructor(world: World, config: VehicleConfig, spawn: SpawnPoint) {
+  private clutchEngagement = 0;
+  private clutchSlip = 0;
+  private clutchTorqueValue = 0;
+
+  constructor(
+    world: World,
+    config: VehicleConfig,
+    spawn: SpawnPoint,
+    surfaceLookup?: (colliderHandle: number) => SurfaceId,
+  ) {
     this.world = world;
     this.config = config;
     this.spawn = spawn;
-    this.engineRpm = config.engine.idleRpm;
+    this.surfaceLookup = surfaceLookup ?? (() => DEFAULT_SURFACE_ID);
+    this.engine = new Engine(config.engine);
     this.transmission = new Transmission(config.transmission);
 
     const [hx, hy, hz] = config.chassis.halfExtents;
@@ -123,6 +145,20 @@ export class VehicleSim {
     );
 
     this.buildWheels();
+    this.applySpawnVelocity(spawn);
+  }
+
+  /** Start the car already rolling (scenario and regression support). */
+  private applySpawnVelocity(spawn: SpawnPoint): void {
+    if (!spawn.velocity) return;
+    const [vx, vy, vz] = spawn.velocity;
+    this.body.setLinvel({ x: vx, y: vy, z: vz }, true);
+    const forwardX = Math.sin(spawn.yaw);
+    const forwardZ = Math.cos(spawn.yaw);
+    const longitudinal = vx * forwardX + vz * forwardZ;
+    for (const wheel of this.wheels) {
+      wheel.omega = longitudinal / Math.max(wheel.radius, 1e-3);
+    }
   }
 
   private buildWheels(): void {
@@ -134,6 +170,8 @@ export class VehicleSim {
       { front: false, left: true, x: -halfTrack, z: chassis.rearAxleZ },
       { front: false, left: false, x: halfTrack, z: chassis.rearAxleZ },
     ];
+
+    const road = SURFACES[DEFAULT_SURFACE_ID];
 
     layout.forEach((entry) => {
       const wheelConfig = entry.front ? this.config.wheelFront : this.config.wheelRear;
@@ -162,6 +200,8 @@ export class VehicleSim {
         forward: vec3(0, 0, 1),
         lateral: vec3(1, 0, 0),
         longVel: 0,
+        surface: DEFAULT_SURFACE_ID,
+        grip: surfaceGrip(road),
       });
     });
   }
@@ -176,8 +216,10 @@ export class VehicleSim {
     this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
     this.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     this.transmission.reset();
-    this.engineRpm = this.config.engine.idleRpm;
+    this.engine.reset();
     this.steerAngle = 0;
+    this.clutchEngagement = 0;
+    this.clutchSlip = 0;
     for (const wheel of this.wheels) {
       wheel.omega = 0;
       wheel.spin = 0;
@@ -190,6 +232,20 @@ export class VehicleSim {
       wheel.driveTorque = 0;
       wheel.brakeTorque = 0;
     }
+    this.applySpawnVelocity(spawn);
+  }
+
+  /** Diagnostics used by tests and the HUD. */
+  get engineRpm(): number {
+    return this.engine.rpm;
+  }
+
+  get engineRunning(): boolean {
+    return this.engine.isRunning;
+  }
+
+  get clutchState(): { engagement: number; slip: number; torque: number } {
+    return { engagement: this.clutchEngagement, slip: this.clutchSlip, torque: this.clutchTorqueValue };
   }
 
   step(dt: number, input: InputState): void {
@@ -218,31 +274,39 @@ export class VehicleSim {
     const steerAlpha = 1 - Math.exp(-dt * 9);
     this.steerAngle += (steerTarget - this.steerAngle) * steerAlpha;
 
-    // ---- engine rpm and gearbox ----------------------------------------
-    // Engine speed is derived from *road* speed through the gearing, not from
-    // raw wheel speed. Using wheel speed would let wheelspin feed back into the
-    // rpm, the shift points and the torque, which makes the gearbox hunt and
-    // destroys acceleration. Wheelspin flare is a Phase 2 engine-inertia model.
-    const drivenRadius =
+    // ---- gearbox --------------------------------------------------------
+    const driven = drivenWheelIndices(config.drivetrain.layout);
+    const finalDrive = config.transmission.finalDrive;
+
+    // Shift decisions use the speed the engine would turn at if the clutch
+    // were locked. While the clutch is slipping (launch, wheelspin, a shift in
+    // progress) the free-revving engine speed is not representative and makes
+    // an automatic box hunt between gears.
+    const previousRatio = this.transmission.ratio;
+    const previousInGear = Math.abs(previousRatio) > 1e-6;
+    let shiftShaftOmega = 0;
+    if (previousInGear) {
+      let sum = 0;
+      for (const index of driven) sum += this.wheels[index].omega;
+      shiftShaftOmega = (sum / driven.length) * previousRatio * finalDrive;
+    }
+    const synchronousRpm = (Math.abs(shiftShaftOmega) * 30) / Math.PI;
+    const clutchLocked = this.clutchEngagement > 0.5 && Math.abs(this.clutchSlip) < 40;
+    const shiftRpm = clutchLocked
+      ? this.engine.rpm
+      : Math.max(synchronousRpm, config.engine.idleRpm);
+    // Road speed expressed as an engine speed in the current gear: no wheelspin.
+    const drivenRadiusForRpm =
       config.drivetrain.layout === 'FWD' ? config.wheelFront.radius : config.wheelRear.radius;
-    const roadWheelOmega = forwardSpeed / drivenRadius;
-    const ratio = this.transmission.ratio;
-    const coupledWheelRpm = Math.abs(
-      wheelRpmFromWheelOmega(roadWheelOmega, ratio, config.transmission.finalDrive),
-    );
-    // Clutch lock: how strongly the engine is tied to the driven wheels.
-    const clutchLock = smoothstep(0, 12, coupledWheelRpm);
-    const freeRevRpm = config.engine.idleRpm + input.throttle * (config.engine.redlineRpm * 0.7 - config.engine.idleRpm);
-    const rpmTarget = clamp(
-      Math.max(config.engine.idleRpm, coupledWheelRpm, freeRevRpm * (1 - clutchLock)),
-      config.engine.idleRpm,
-      config.engine.redlineRpm + 150,
-    );
-    const rpmAlpha = 1 - Math.exp(-dt * (Math.abs(ratio) < 1e-6 ? 7 : 26));
-    this.engineRpm += (rpmTarget - this.engineRpm) * rpmAlpha;
+    const roadRpm =
+      (Math.abs(forwardSpeed) / Math.max(drivenRadiusForRpm, 1e-3)) *
+      Math.abs(previousRatio) *
+      finalDrive *
+      (30 / Math.PI);
 
     const shift = this.transmission.update(dt, {
-      rpm: this.engineRpm,
+      rpm: shiftRpm,
+      roadRpm,
       throttle: input.throttle,
       speed: forwardSpeed,
       brake: input.brake,
@@ -250,30 +314,135 @@ export class VehicleSim {
       shiftDown: input.shiftDown,
     });
 
-    const currentRatio = this.transmission.ratio;
-    let axleTorque = 0;
-    if (!shift.torqueCut && Math.abs(currentRatio) > 1e-6) {
-      const netTorque = engineNetTorque(config.engine, this.engineRpm, input.throttle);
-      // Partial *positive* torque transfer while the clutch slips, so the car
-      // can launch from rest. Negative torque (engine braking, friction) only
-      // reaches the wheels once the clutch is actually locked; otherwise a
-      // parked car would be dragged backwards by idle drag through a slipping
-      // clutch, which is not physical.
-      // Engine braking only acts once the car is actually rolling; otherwise
-      // idle drag through a slipping clutch makes a parked car creep.
-      const rolling = Math.abs(forwardSpeed) > 0.3;
-      const transfer = netTorque >= 0 ? 0.4 + 0.6 * clutchLock : rolling ? clutchLock : 0;
-      axleTorque =
-        netTorque * currentRatio * config.transmission.finalDrive * config.transmission.efficiency * transfer;
+    const ratio = this.transmission.ratio;
+    const inGear = Math.abs(ratio) > 1e-6;
+
+    // ---- engine, clutch and driveline -----------------------------------
+    // Shaft speed is the driven wheels' mean angular velocity referred through
+    // the gearbox (gearing multiplies engine speed down to the wheels, so the
+    // shaft turns faster than the wheels by ratio * finalDrive). The engine has
+    // its own omega; the clutch torque couples the two.
+    let shaftOmega = 0;
+    if (inGear) {
+      let wheelOmegaSum = 0;
+      for (const index of driven) wheelOmegaSum += this.wheels[index].omega;
+      shaftOmega = (wheelOmegaSum / driven.length) * ratio * finalDrive;
     }
 
+    const engagementTarget = clutchEngagementTarget(
+      config.clutch,
+      this.engine.rpm,
+      Math.abs(forwardSpeed),
+      inGear,
+      shift.torqueCut,
+    );
+    this.clutchEngagement = advanceEngagement(
+      this.clutchEngagement,
+      engagementTarget,
+      config.clutch.engageTime,
+      config.clutch.releaseTime,
+      dt,
+    );
+
+    let drivenInertia = 0;
+    const drivenRadius = config.drivetrain.layout === 'FWD' ? config.wheelFront.radius : config.wheelRear.radius;
+    for (const index of driven) drivenInertia += this.wheels[index].inertia;
+    const gearReflection = Math.pow(Math.max(Math.abs(ratio) * finalDrive, 0.5), 2);
+    // Inertia seen at the clutch includes the wheels *and the vehicle mass*: a
+    // locked driveline has to accelerate the whole car through the gearing.
+    const vehicleInertiaReflected = (config.chassis.mass * drivenRadius * drivenRadius) / gearReflection;
+    const reflectedInertia =
+      drivenInertia / gearReflection + vehicleInertiaReflected + config.clutch.inertia;
+
+    this.clutchSlip = this.engine.angularVelocity - shaftOmega;
+    // A clutch cannot transmit more torque than the engine produces without
+    // dragging the engine down. Applying full friction capacity during a big
+    // slip lets the flywheel dump its stored energy into the tires, which
+    // produces wheelspin spikes on a part-throttle launch. Limiting the
+    // slipping capacity to the engine's available torque keeps the launch
+    // physical; once the clutch is nearly locked, full capacity is available
+    // so engine braking works.
+    const engineAvailable = Math.max(
+      0,
+      engineNetTorque(config.engine, this.engine.rpm, shift.torqueCut ? 0 : input.throttle),
+    );
+    const slipping = Math.abs(this.clutchSlip) > 20;
+    const torqueReactiveLimit = slipping
+      ? Math.min(config.clutch.maxTorque, engineAvailable * 1.15 + 25)
+      : config.clutch.maxTorque;
+    const capacityLimit = Math.min(
+      launchCapacityLimit(
+        config.clutch,
+        this.engine.rpm,
+        config.engine.idleRpm,
+        input.throttle,
+        inGear && Math.abs(forwardSpeed) > config.clutch.lockSpeed,
+      ),
+      torqueReactiveLimit,
+    );
+    void reflectedInertia;
+    const coupling = clutchTorque(
+      config.clutch,
+      this.clutchEngagement,
+      this.engine.angularVelocity,
+      shaftOmega,
+      capacityLimit,
+    );
+    // The clutch drags the engine; positive coupling accelerates the driveline.
+    // A shift interrupts torque: the engine is off throttle while it happens.
+    this.clutchTorqueValue = coupling;
+    const engineThrottle = shift.torqueCut ? 0 : input.throttle;
+    this.engine.update(dt, engineThrottle, coupling);
+
+    const axleTorque = inGear
+      ? coupling * ratio * finalDrive * config.transmission.efficiency
+      : 0;
+
     const axle = splitAxleTorque(config.drivetrain.layout, config.drivetrain.frontSplit, axleTorque);
-    const frontDrive = perWheelTorque(axle.front);
-    const rearDrive = perWheelTorque(axle.rear);
-    this.wheels[0].driveTorque = frontDrive;
-    this.wheels[1].driveTorque = frontDrive;
-    this.wheels[2].driveTorque = rearDrive;
-    this.wheels[3].driveTorque = rearDrive;
+    let frontTorque = axle.front;
+    let rearTorque = axle.rear;
+
+    // Centre coupling for AWD: transfer torque toward the slower axle.
+    if (
+      config.drivetrain.layout === 'AWD' &&
+      config.drivetrain.centerDifferential &&
+      Math.abs(axleTorque) > 1e-6
+    ) {
+      const frontMean = (this.wheels[0].omega + this.wheels[1].omega) / 2;
+      const rearMean = (this.wheels[2].omega + this.wheels[3].omega) / 2;
+      const center = distributeAxleTorque(
+        config.drivetrain.centerDifferential,
+        axleTorque,
+        frontMean,
+        rearMean,
+        (this.wheels[0].inertia + this.wheels[2].inertia) / 2,
+        dt,
+      );
+      frontTorque = center.left;
+      rearTorque = center.right;
+    }
+
+    const front = distributeAxleTorque(
+      config.drivetrain.frontDifferential,
+      frontTorque,
+      this.wheels[0].omega,
+      this.wheels[1].omega,
+      (this.wheels[0].inertia + this.wheels[1].inertia) / 2,
+      dt,
+    );
+    const rear = distributeAxleTorque(
+      config.drivetrain.rearDifferential,
+      rearTorque,
+      this.wheels[2].omega,
+      this.wheels[3].omega,
+      (this.wheels[2].inertia + this.wheels[3].inertia) / 2,
+      dt,
+    );
+
+    this.wheels[0].driveTorque = front.left;
+    this.wheels[1].driveTorque = front.right;
+    this.wheels[2].driveTorque = rear.left;
+    this.wheels[3].driveTorque = rear.right;
 
     const brakeFront = config.brakes.maxTorqueFront * input.brake;
     const brakeRear = config.brakes.maxTorqueRear * input.brake + config.brakes.handbrakeTorque * input.handbrake;
@@ -286,6 +455,7 @@ export class VehicleSim {
     const down = scale(up, -1);
     const suspensionConfig = config.suspension;
     const loads = [0, 0, 0, 0];
+    const surfaceBlend = 1 - Math.exp(-dt / SURFACE_BLEND_SECONDS);
 
     for (let i = 0; i < this.wheels.length; i += 1) {
       const wheel = this.wheels[i];
@@ -309,6 +479,23 @@ export class VehicleSim {
         wheel.slipAngle = 0;
         continue;
       }
+
+      // Which material is under this wheel? Rapier colliders are tagged at build
+      // time; an untagged collider falls back to dry asphalt.
+      const hitCollider = (hit as unknown as { collider?: Collider }).collider;
+      const surfaceId = hitCollider ? this.surfaceLookup(hitCollider.handle) : DEFAULT_SURFACE_ID;
+      const definition = SURFACES[surfaceId] ?? SURFACES[DEFAULT_SURFACE_ID];
+      wheel.surface = definition.id;
+      const targetGrip = surfaceGrip(definition);
+      // Blend grip across boundaries instead of stepping the force . This is a
+      // documented approximation of a contact patch that spans two surfaces.
+      wheel.grip = {
+        gripLong: wheel.grip.gripLong + (targetGrip.gripLong - wheel.grip.gripLong) * surfaceBlend,
+        gripLat: wheel.grip.gripLat + (targetGrip.gripLat - wheel.grip.gripLat) * surfaceBlend,
+        rollingResistance:
+          wheel.grip.rollingResistance +
+          (targetGrip.rollingResistance - wheel.grip.rollingResistance) * surfaceBlend,
+      };
 
       const distance = Math.max(wheel.radius * 0.6, hit.timeOfImpact);
       wheel.contact = true;
@@ -377,12 +564,16 @@ export class VehicleSim {
       let lateral = 0;
 
       if (wheel.contact && load > 1) {
-        const forces = tireForces(config.tire, {
-          load,
-          slipRatio: wheel.slipRatio,
-          slipAngle: wheel.slipAngle,
-          forwardSpeed: wheel.longVel,
-        });
+        const forces = tireForces(
+          config.tire,
+          {
+            load,
+            slipRatio: wheel.slipRatio,
+            slipAngle: wheel.slipAngle,
+            forwardSpeed: wheel.longVel,
+          },
+          wheel.grip,
+        );
         longitudinal = forces.longitudinal;
         lateral = forces.lateral;
 
@@ -443,6 +634,8 @@ export class VehicleSim {
       load: wheel.load,
       slipRatio: wheel.slipRatio,
       slipAngle: wheel.slipAngle,
+      surface: wheel.surface,
+      grip: wheel.grip.gripLong,
     }));
 
     return {
@@ -450,13 +643,16 @@ export class VehicleSim {
       rotation: [rotation.x, rotation.y, rotation.z, rotation.w],
       linearVelocity: [linvel.x, linvel.y, linvel.z],
       wheels,
-      rpm: this.engineRpm,
+      rpm: this.engine.rpm,
       gear: this.transmission.gear,
       speedKmh: signedSpeed * 3.6,
       throttle: this.inputThrottle,
       brake: this.inputBrake,
       handbrake: this.inputHandbrake,
       steerAngle: this.steerAngle,
+      engineRunning: this.engine.isRunning,
+      clutchEngagement: this.clutchEngagement,
+      clutchSlip: this.clutchSlip,
     };
   }
 

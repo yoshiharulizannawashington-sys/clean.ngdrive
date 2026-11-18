@@ -18,6 +18,8 @@ function makeSnapshot(time: number, x: number): SimSnapshot {
         load: 1000,
         slipRatio: 0,
         slipAngle: 0,
+        surface: 'asphalt-dry' as const,
+        grip: 1,
       })),
       rpm: 1000,
       gear: 1,
@@ -26,6 +28,9 @@ function makeSnapshot(time: number, x: number): SimSnapshot {
       brake: 0,
       handbrake: 0,
       steerAngle: 0,
+      engineRunning: true,
+      clutchEngagement: 1,
+      clutchSlip: 0,
     },
     props: [],
     stats: {

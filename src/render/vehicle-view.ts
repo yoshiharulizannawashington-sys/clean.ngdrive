@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { VehicleConfig } from '../sim/vehicle/types';
 import type { InterpolatedFrame } from '../app/snapshot-buffer';
+import { mergeStaticGeometry, type GeometryInstance } from './geometry';
 
 interface WheelView {
   pivot: THREE.Group;
@@ -332,14 +333,21 @@ export class VehicleView {
       disc.position.x = width * 0.1;
       spin.add(disc);
 
+      // Ten spokes per wheel merged into one mesh: the spokes rotate together,
+      // so there is no reason to submit ten draw calls for them.
+      const spokeParts: GeometryInstance[] = [];
       for (let i = 0; i < 5; i += 1) {
         for (const face of [-1, 1]) {
-          const spoke = new THREE.Mesh(new THREE.BoxGeometry(0.045, radius * 1.18, 0.075), this.rimMaterial);
-          spoke.rotation.x = (i / 5) * Math.PI * 2 + 0.3;
-          spoke.position.x = face * width * 0.31;
-          spin.add(spoke);
+          const matrix = new THREE.Matrix4()
+            .makeRotationX((i / 5) * Math.PI * 2 + 0.3)
+            .setPosition(face * width * 0.31, 0, 0);
+          spokeParts.push({ geometry: new THREE.BoxGeometry(0.045, radius * 1.18, 0.075), matrix });
         }
       }
+      const spokes = new THREE.Mesh(mergeStaticGeometry(spokeParts), this.rimMaterial);
+      spokeParts.forEach((part) => part.geometry.dispose());
+      spokes.castShadow = true;
+      spin.add(spokes);
 
       const cap = new THREE.Mesh(
         new THREE.CylinderGeometry(radius * 0.16, radius * 0.16, width * 1.02, 12),

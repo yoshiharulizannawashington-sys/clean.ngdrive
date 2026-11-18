@@ -2,7 +2,7 @@
   "name": "browser-drive",
   "private": true,
   "version": "0.1.0",
-  "description": "Browser-native vehicle simulation sandbox. Milestone 0: engine foundation.",
+  "description": "Browser-native vehicle simulation sandbox. Milestone 1: advanced vehicle dynamics.",
   "type": "module",
   "scripts": {
     "dev": "vite",

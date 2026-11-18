@@ -121,7 +121,9 @@ async function initialize(nextConfig: VehicleConfig, spawn: SpawnPoint): Promise
   await RAPIER.init();
 
   simWorld = createTestWorld();
-  vehicle = new VehicleSim(simWorld.world, nextConfig, spawn);
+  vehicle = new VehicleSim(simWorld.world, nextConfig, spawn, (handle) =>
+    simWorld ? simWorld.surfaceAt(handle) : 'asphalt-dry',
+  );
   config = nextConfig;
   clock = new SimulationClock(SIM_HZ, 8);
   sequence = 0;

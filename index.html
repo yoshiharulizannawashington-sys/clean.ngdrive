@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#0a0c0f" />
     <meta
       name="description"
-      content="Browser Drive — a browser-native vehicle simulation sandbox. Milestone 0 foundation build."
+      content="Browser Drive — a browser-native vehicle simulation sandbox. Milestone 1 advanced vehicle dynamics."
     />
     <title>Browser Drive — Vehicle Simulation</title>
     <link rel="stylesheet" href="./src/styles.css" />
@@ -73,14 +73,14 @@
 
             <section class="card">
               <h2>Foundation status</h2>
-              <p class="card__sub">Milestone 0 — what is real, and what is not.</p>
+              <p class="card__sub">Milestone 1 — what is real, and what is not.</p>
               <ul class="status status--done">
                 <li>Fixed 120 Hz simulation in a Web Worker, interpolated rendering</li>
-                <li>Rapier rigid-body world: chassis, ground, barriers, ramps, dynamic cones</li>
-                <li>Four independently raycast suspension units with springs, dampers, anti-roll bars</li>
-                <li>Slip-ratio / slip-angle tire model with load sensitivity and combined slip</li>
-                <li>Torque-curve engine, automatic gearbox, open differential, RWD driveline</li>
-                <li>Weight transfer, body roll, wheel lock-up and wheelspin from the solver</li>
+                <li>Rotating engine with inertia, idle governor, rev limiter, stalling and restart</li>
+                <li>Slipping clutch with launch modulation and torque-interrupted shifts</li>
+                <li>Open, viscous, clutch-type, geared and locking differentials · RWD, FWD, AWD</li>
+                <li>Ten surface materials with separate longitudinal/lateral grip and rolling resistance</li>
+                <li>Four raycast suspension units, combined-slip tires, weight transfer and body roll</li>
                 <li>Chase, close, hood, cockpit and free cameras · keyboard and gamepad</li>
               </ul>
               <ul class="status status--todo">
@@ -109,7 +109,7 @@
           </div>
 
           <footer class="menu__foot">
-            <span>Milestone 0 · foundation build</span>
+            <span>Milestone 1 · advanced vehicle dynamics</span>
             <span id="menu-capability">Detecting hardware…</span>
           </footer>
         </div>
